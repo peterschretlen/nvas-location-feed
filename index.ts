@@ -11,23 +11,24 @@ const nvasUrl: string = "http://webservices.nextbus.com/service/publicXMLFeed";
 interface IVehicleLocationParameters {
   command: string;
   a: string;
-  r?: string;
   t?: number;
+  r?: string;
 }
 
 type WriterFunction = (location: any[]) => Promise<ApiResponse<any, any>>;
 
 function fetchNvasLocations( write: WriterFunction ): () => void {
 
+  let lastTimeMillis: number = 0;
+
   return async () => {
     const vlParams: IVehicleLocationParameters = {
       command: "vehicleLocations",
       a: "ttc",
-        // r: "65",
-        // t: "1495374664331",
+      t: lastTimeMillis,
     };
 
-    const response = await axios.get(nvasUrl, { params : vlParams } );
+    const response = await axios.get(nvasUrl, { params : vlParams, headers: { "Accept-Encoding": "gzip, deflate" } });
 
     if (response.status === 200) {
 
@@ -35,13 +36,14 @@ function fetchNvasLocations( write: WriterFunction ): () => void {
 
       xmlParser( response.data,  async (e: any, r: any) => {
 
+        lastTimeMillis = parseInt(r.body.lastTime[0].$.time, 10);
         const locations: any[] = [];
         r.body.vehicle.forEach( (l: { $: any; }) => {
 
           const locationDoc = {
             location: { lat: parseFloat(l.$.lat), lon: parseFloat(l.$.lon) },
             secsSinceReport: parseInt(l.$.secsSinceReport, 10),
-            nvasLastTimestamp: new Date(parseInt( r.body.lastTime[0].$.time, 10 )),
+            nvasLastTimestamp: new Date( lastTimeMillis),
             routeTag: l.$.routeTag,
             dirTag: l.$.dirTag,
             vehicleId: l.$.id,
