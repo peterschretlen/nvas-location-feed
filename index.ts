@@ -5,6 +5,7 @@ import log4js from "log4js";
 import { Job, scheduleJob } from "node-schedule";
 import xml2js from "xml2js";
 import { parseBooleans } from "xml2js/lib/processors";
+import fences from "./fences.json";
 
 const nvasUrl: string = "http://webservices.nextbus.com/service/publicXMLFeed";
 
@@ -66,7 +67,82 @@ function fetchNvasLocations( write: WriterFunction ): () => void {
   };
 }
 
-async function checkIndex(client: Client, idxName: string) {
+function fetchGeoFenceHitsAndClearIndex( client: Client,
+                                         indexHits: string,
+                                         indexLocations: string,
+                                         write: WriterFunction ): () => void {
+
+  return async () => {
+
+    const query = {
+      index: indexLocations,
+      size: 1000,
+      body: {
+        query: {
+          bool: {
+            should: fences.features.map( (f) => {
+              return {
+                bool: {
+                  filter: {
+                    geo_polygon: {
+                      location: {
+                        points: f.geometry.coordinates[0],
+                      },
+                    },
+                  },
+                },
+              };
+            }),
+            minimum_should_match: 1,
+          },
+        },
+      },
+    };
+    // query all the geofences
+    try {
+      const resultInsideFences = await client.search( query );
+      await client.deleteByQuery(
+        {
+          index: indexHits,
+          body: { query: { match_all: {} }}},
+      );
+
+      const hitsUpdate = resultInsideFences.body.hits.hits.map( (h: { _source: any; }) => {
+
+        const action = {
+          update : {
+            _id: h._source.vehicleId,
+            _index: indexHits,
+            _type: "_doc",
+          },
+        };
+
+        const data = {
+          doc : {
+            vehicleId: h._source.vehicleId,
+            hitValue: 10,
+          },
+          doc_as_upsert: true,
+        };
+
+        return `${JSON.stringify(action)}\n${JSON.stringify(data)}`;
+      }).join("\n") + "\n";
+
+      client.bulk({
+        index: indexHits,
+        refresh: "true",
+        body: hitsUpdate,
+      });
+
+    } catch (e) {
+      // console.log(e);
+    }
+
+  };
+
+}
+
+async function checkIndex(client: Client, idxName: string, mapping: object) {
 
   logger.info(`Checking for index: ${idxName}`);
   const response: ApiResponse =  await client.indices.exists({index: idxName});
@@ -80,17 +156,7 @@ async function checkIndex(client: Client, idxName: string) {
         index: idxName,
         body: {
           mappings: {
-            properties: {
-              location: { type: "geo_point" },
-              secsSinceReport: { type: "integer" },
-              nvasLastTimestamp: { type: "date" },
-              routeTag: { type: "text" },
-              dirTag: { type: "keyword" },
-              vehicleId: { type: "keyword" },
-              predictable: { type: "boolean" },
-              heading: { type: "integer" },
-              speedKmHr: { type: "integer" },
-            },
+            properties: mapping,
           },
         },
     });
@@ -101,12 +167,12 @@ async function checkIndex(client: Client, idxName: string) {
 function esWriter(client: Client, idxName: string): WriterFunction {
   return async ( locations: any[] ): Promise<ApiResponse<any, any>> => {
 
-    const bulkUpdate = locations.map( (l) => locationToBulkUpdate(l, idxName) ).join("\n") + "\n";
+    const bulk = locations.map( (l) => locationToBulkUpdate(l, idxName) ).join("\n") + "\n";
     // logger.info( bulkUpdate );
     return client.bulk({
       index: idxName,
       refresh: "true",
-      body: bulkUpdate,
+      body: bulk,
     });
   };
 }
@@ -136,8 +202,6 @@ const esClient = new Client({
   node: "http://elastic:changeme@localhost:9200",
 });
 
-const indexName: string = "alert-poc";
-
 log4js.addLayout("json", (config) => {
   return (logEvent) => JSON.stringify(logEvent);
 });
@@ -154,9 +218,67 @@ log4js.configure({
 
 const logger: log4js.Logger = log4js.getLogger();
 
-checkIndex(esClient, indexName);
+const vehicleLocationsIndex: string = "poc-vehicle-locations";
+const vehicleLocationsMapping = {
+  location: { type: "geo_point" },
+  secsSinceReport: { type: "integer" },
+  nvasLastTimestamp: { type: "date" },
+  routeTag: { type: "text" },
+  dirTag: { type: "keyword" },
+  vehicleId: { type: "keyword" },
+  predictable: { type: "boolean" },
+  heading: { type: "integer" },
+  speedKmHr: { type: "integer" },
+};
 
-const writer = esWriter( esClient, indexName );
+const vehicleHitsIndex: string = "poc-vehicle-hits";
+const vehicleHitsMapping = {
+  vehicleId: { type: "keyword" },
+  hitValue: { type: "integer" },
+};
+
+const geoFenceIndex: string = "poc-geo-fences";
+const geoFenceMapping = {
+  coordinates: { type: "geo_shape" },
+  name: { type: "keyword" },
+  region: { type: "long" },
+};
+
+checkIndex(esClient, vehicleLocationsIndex, vehicleLocationsMapping);
+checkIndex(esClient, vehicleHitsIndex, vehicleHitsMapping);
+checkIndex(esClient, geoFenceIndex, geoFenceMapping);
+
+const bulkUpdate = fences.features.map( (f) => {
+  const action = {
+    update : {
+      _id: f.id,
+      _index: geoFenceIndex,
+      _type: "_doc",
+    },
+  };
+
+  const data = {
+    doc : {
+      coordinates: f.geometry,
+      name: f.properties.name,
+      region: f.properties.region,
+    },
+    doc_as_upsert: true,
+  };
+
+  return `${JSON.stringify(action)}\n${JSON.stringify(data)}`;
+}).join("\n") + "\n";
+
+esClient.bulk({
+  index: geoFenceIndex,
+  refresh: "true",
+  body: bulkUpdate,
+});
+
+const writer = esWriter( esClient, vehicleLocationsIndex );
 const fetch = fetchNvasLocations( writer );
+const locationJob: Job = scheduleJob("*/15 * * * * *", fetch  );
 
-const job: Job = scheduleJob("*/30 * * * * *", fetch  );
+const hitsWriter = esWriter( esClient, vehicleLocationsIndex );
+const alert = fetchGeoFenceHitsAndClearIndex( esClient, vehicleHitsIndex, vehicleLocationsIndex, hitsWriter );
+const alertJob: Job = scheduleJob("*/5 * * * * *", alert  );
